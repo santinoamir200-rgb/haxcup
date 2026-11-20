@@ -1,6 +1,6 @@
 (function (g) {
 'use strict';
-/* shim.js v2.1 - HaxCup PS3. Solo usa fillRect/clearRect/drawImage/loadImage nativos. Fix: addEventListener global sin this + repintado por frame (doble buffer). */
+/* shim.js v2.2 - HaxCup PS3. Solo usa fillRect/clearRect/drawImage/loadImage nativos. Fix: addEventListener global sin this + repintado por frame (doble buffer). */
 var N = g.__native;
 var BTN = ['up','down','left','right','cross','circle','square','triangle','l1','r1','l2','r2','l3','r3','start','select'];
 var DEFAULT_MAP = {up:'ArrowUp',down:'ArrowDown',left:'ArrowLeft',right:'ArrowRight',cross:'z',circle:'x',square:'c',triangle:'v',l1:'a',r1:'s',l2:'q',r2:'w',start:'Enter',select:'Escape'};
@@ -26,7 +26,10 @@ var NF = N.fillRect, ND = N.drawImage, NC = N.clearRect;
 /* El runtime nativo NO limpia ni conserva el framebuffer: SDL_RenderPresent con doble buffer
    alterna dos buffers, y si un frame no dibuja nada el que se muestra es el otro (negro).
    Por eso grabamos todo lo dibujado en el frame y, si un frame no dibuja, lo repetimos. */
-var cur = [], last = null, REC_MAX = 400000;
+var cur = [], last = null, REC_MAX = 400000, idleFrames = 0;
+/* REPLAY_SETTLE: 0 = repetir el ultimo frame SIEMPRE (lo mas seguro). Si el menu va lento en la consola, probar 6:
+   solo se repite durante 6 frames despues del ultimo cambio (alcanza para los dos buffers de SDL). */
+var REPLAY_SETTLE = 0;
 function nFill(r, gg, b, a, x, y, w, h) { drawCount++; NF(r, gg, b, a, x, y, w, h); if (cur.length < REC_MAX) cur.push(0, r, gg, b, a, x, y, w, h); }
 function nImg(id, sx, sy, sw, sh, dx, dy, dw, dh, a) { drawCount++; ND(id, sx, sy, sw, sh, dx, dy, dw, dh, a); if (cur.length < REC_MAX) cur.push(1, id, sx, sy, sw, sh, dx, dy, dw, dh, a); }
 function nClear(x, y, w, h) { drawCount++; NC(x, y, w, h); if (cur.length < REC_MAX) cur.push(2, x, y, w, h); }
@@ -469,6 +472,7 @@ function encodePNG(buf, w, h) {
 
 /* ---------- buffers y canvas ---------- */
 var mainCanvas = null, focusEl = null;
+var bufBytes = 0;
 var BUF_LIMIT = 1400000;      /* pixeles maximos de un canvas auxiliar (se reduce la resolucion si lo pasa) */
 function setMain(c) { mainCanvas = c; c.__main = true; c.__f = 1; N.setSize(c.__w, c.__h); markDirty(); }
 
@@ -479,11 +483,13 @@ Canvas.prototype.__prep = function () {
   var w = Math.max(0, this.__w), h = Math.max(0, this.__h);
   if (!w || !h) return false;
   var f = Math.min(1, Math.sqrt(BUF_LIMIT / (w * h)));
+  if (bufBytes > 80 * 1024 * 1024) f = Math.min(f, 0.25);   /* mucha memoria en buffers: bajar resolucion */
   this.__f = f; this.__bw = Math.max(1, Math.round(w * f)); this.__bh = Math.max(1, Math.round(h * f));
-  this.__buf = new Uint8Array(this.__bw * this.__bh * 4);
+  this.__buf = new Uint8Array(this.__bw * this.__bh * 4); bufBytes += this.__bw * this.__bh * 4;
   return true;
 };
 Canvas.prototype.__resized = function () {
+  if (this.__buf) bufBytes -= this.__buf.length;
   this.__buf = null; this.__ver++; this.__tex = null;
   if (this.__ctx) this.__ctx.__reset();
   if (this.__main) { N.setSize(this.__w, this.__h); markDirty(); }
@@ -501,13 +507,15 @@ Canvas.prototype.getContext = function (t) {
 Canvas.prototype.getBoundingClientRect = function () { return { left: 0, top: 0, x: 0, y: 0, width: this.__w, height: this.__h, right: this.__w, bottom: this.__h }; };
 Canvas.prototype.toDataURL = function () { return ''; };
 Canvas.prototype.toBlob = function (cb) { if (cb) cb(null); };
-var upCount = 0;
+var upCount = 0, upBytes = 0, TEX_MAX = 100 * 1024 * 1024, texWarned = false;
 function texOf(cv) {
   if (cv.__tex && cv.__texVer === cv.__ver) return cv.__tex;
   if (upCount > 3000) return null;
+  /* tope de memoria: main.c no libera texturas, asi que sin tope un canvas que cambia seguido llena la RAM y cuelga la PS3 */
+  if (upBytes + cv.__bw * cv.__bh * 4 > TEX_MAX) { if (!texWarned) { texWarned = true; g.console.log('[ps3html] tope de texturas alcanzado (' + upCount + ' subidas): no se dibujan mas canvas nuevos'); } return cv.__tex || null; }
   var r = N.loadImage(encodePNG(cv.__buf, cv.__bw, cv.__bh));
   if (!r) return null;
-  upCount++; cv.__tex = { id: r[0] }; cv.__texVer = cv.__ver; return cv.__tex;
+  upCount++; upBytes += cv.__bw * cv.__bh * 4; cv.__tex = { id: r[0] }; cv.__texVer = cv.__ver; return cv.__tex;
 }
 
 /* getContext sobre elementos que no son canvas (ej. el fondo decorativo): canvas auxiliar descartable */
@@ -1411,6 +1419,6 @@ g.__frame = function (t, mask) {
   cur = [];
   try { frameInner(t, mask); }
   catch (e) { g.console.log('ERR frame: ' + (e && e.stack || e)); }
-  if (cur.length) last = cur; else if (last) replay(last);
+  if (cur.length) { last = cur; idleFrames = 0; } else if (last) { idleFrames++; if (!REPLAY_SETTLE || idleFrames <= REPLAY_SETTLE) replay(last); }
 };
 })(globalThis);
