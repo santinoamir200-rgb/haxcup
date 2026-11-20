@@ -45,9 +45,16 @@ for old, new in patches:
     if s.count(old) != 1:
         sys.exit("ERROR: no encontre un bloque a parchear en quickjs.c (cambio la version?):\n" + old)
     s = s.replace(old, new)
+# 3) newlib no tiene tm_gmtoff: la zona horaria queda en UTC (offset 0).
+n = s.count("tm.tm_gmtoff")
+if n < 1:
+    sys.exit("ERROR: no encontre tm_gmtoff en quickjs.c")
+s = s.replace("tm.tm_gmtoff", "0")
 open(p, "w", encoding="utf-8").write(s)
+print("parches aplicados a quickjs.c (tm_gmtoff reemplazado %d vez/veces)" % n)
 PY
 grep -q QJS_NO_ATOMICS quickjs.c
+if grep -q 'tm\.tm_gmtoff' quickjs.c; then echo 'ERROR: sigue tm_gmtoff en quickjs.c'; exit 1; fi
 
 CFLAGS=(-O2 -mcpu=cell -mhard-float -fmodulo-sched -ffunction-sections -fdata-sections
         -Wall -Wno-array-bounds -Wno-format-truncation -fwrapv
@@ -59,7 +66,17 @@ CFLAGS=(-O2 -mcpu=cell -mhard-float -fmodulo-sched -ffunction-sections -fdata-se
 if ! echo '#include <fenv.h>' | $CC -E -x c - >/dev/null 2>&1; then
   echo "newlib sin fenv.h: uso uno vacio"
   mkdir -p "$WORK/compat"
-  printf '#ifndef QJS_COMPAT_FENV_H\n#define QJS_COMPAT_FENV_H\n#endif\n' > "$WORK/compat/fenv.h"
+  cat > "$WORK/compat/fenv.h" <<'EOF_FENV'
+#ifndef QJS_COMPAT_FENV_H
+#define QJS_COMPAT_FENV_H
+#define FE_TONEAREST  0
+#define FE_TOWARDZERO 1
+#define FE_UPWARD     2
+#define FE_DOWNWARD   3
+static inline int fesetround(int r) { (void)r; return 0; }
+static inline int fegetround(void) { return FE_TONEAREST; }
+#endif
+EOF_FENV
   CFLAGS+=(-I"$WORK/compat")
 fi
 
@@ -73,6 +90,9 @@ done
 rm -f libquickjs.a
 $AR rcs libquickjs.a "${OBJS[@]}"
 $RANLIB libquickjs.a
+
+echo "--- simbolos externos de libquickjs.a (informativo) ---"
+$PS3DEV/ppu/bin/powerpc64-ps3-elf-nm -u libquickjs.a 2>/dev/null | sort -u | grep -v " U JS_" | head -80 || true
 
 mkdir -p "$PORTLIBS/lib" "$PORTLIBS/include/quickjs"
 cp libquickjs.a "$PORTLIBS/lib/"
