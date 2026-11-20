@@ -1,6 +1,6 @@
 (function (g) {
 'use strict';
-/* shim.js v2 - HaxCup PS3. Solo usa fillRect/clearRect/drawImage/loadImage nativos. */
+/* shim.js v2.1 - HaxCup PS3. Solo usa fillRect/clearRect/drawImage/loadImage nativos. Fix: addEventListener global sin this + repintado por frame (doble buffer). */
 var N = g.__native;
 var BTN = ['up','down','left','right','cross','circle','square','triangle','l1','r1','l2','r2','l3','r3','start','select'];
 var DEFAULT_MAP = {up:'ArrowUp',down:'ArrowDown',left:'ArrowLeft',right:'ArrowRight',cross:'z',circle:'x',square:'c',triangle:'v',l1:'a',r1:'s',l2:'q',r2:'w',start:'Enter',select:'Escape'};
@@ -22,9 +22,22 @@ function markDirty() { uiDirty = true; }
 
 /* contador de dibujo para saber si el juego pinto en este frame */
 var drawCount = 0;
-var NF = N.fillRect, ND = N.drawImage;
-function nFill(r, gg, b, a, x, y, w, h) { drawCount++; NF(r, gg, b, a, x, y, w, h); }
-function nImg(id, sx, sy, sw, sh, dx, dy, dw, dh, a) { drawCount++; ND(id, sx, sy, sw, sh, dx, dy, dw, dh, a); }
+var NF = N.fillRect, ND = N.drawImage, NC = N.clearRect;
+/* El runtime nativo NO limpia ni conserva el framebuffer: SDL_RenderPresent con doble buffer
+   alterna dos buffers, y si un frame no dibuja nada el que se muestra es el otro (negro).
+   Por eso grabamos todo lo dibujado en el frame y, si un frame no dibuja, lo repetimos. */
+var cur = [], last = null, REC_MAX = 400000;
+function nFill(r, gg, b, a, x, y, w, h) { drawCount++; NF(r, gg, b, a, x, y, w, h); if (cur.length < REC_MAX) cur.push(0, r, gg, b, a, x, y, w, h); }
+function nImg(id, sx, sy, sw, sh, dx, dy, dw, dh, a) { drawCount++; ND(id, sx, sy, sw, sh, dx, dy, dw, dh, a); if (cur.length < REC_MAX) cur.push(1, id, sx, sy, sw, sh, dx, dy, dw, dh, a); }
+function nClear(x, y, w, h) { drawCount++; NC(x, y, w, h); if (cur.length < REC_MAX) cur.push(2, x, y, w, h); }
+function replay(L) {
+  for (var i = 0, n = L.length; i < n;) {
+    var k = L[i];
+    if (k === 0) { NF(L[i + 1], L[i + 2], L[i + 3], L[i + 4], L[i + 5], L[i + 6], L[i + 7], L[i + 8]); i += 9; }
+    else if (k === 1) { ND(L[i + 1], L[i + 2], L[i + 3], L[i + 4], L[i + 5], L[i + 6], L[i + 7], L[i + 8], L[i + 9], L[i + 10]); i += 11; }
+    else { NC(L[i + 1], L[i + 2], L[i + 3], L[i + 4]); i += 5; }
+  }
+}
 
 /* ---------- eventos ---------- */
 function Target() {
@@ -42,7 +55,10 @@ Target.prototype.__fire = function (t, ev) {
 Target.prototype.dispatchEvent = function (ev) { if (!ev.target) ev.target = this; this.__fire(ev.type, ev); return true; };
 Target.call(g);
 g.__L = {}; g.addEventListener = Target.prototype.addEventListener; g.removeEventListener = Target.prototype.removeEventListener;
-g.__fire = Target.prototype.__fire; g.dispatchEvent = Target.prototype.dispatchEvent;
+g.__fire = function (t, ev) { return Target.prototype.__fire.call(g, t, ev); };
+g.addEventListener = function (t, f) { return Target.prototype.addEventListener.call(g, t, f); };
+g.removeEventListener = function (t, f) { return Target.prototype.removeEventListener.call(g, t, f); };
+g.dispatchEvent = function (ev) { return Target.prototype.dispatchEvent.call(g, ev); };
 function mkEv(type, target, extra) {
   var ev = { type: type, target: target, bubbles: true, defaultPrevented: false, __stop: false,
     preventDefault: function () { ev.defaultPrevented = true; }, stopPropagation: function () { ev.__stop = true; }, stopImmediatePropagation: function () { ev.__stop = true; } };
@@ -886,7 +902,7 @@ CP.clearRect = function (x, y, w, h) {
   var bw = cv.__main ? cv.__w : cv.__bw, bh = cv.__main ? cv.__h : cv.__bh, cl = s.clip;
   var L = Math.max(r[0], cl ? cl[0] : 0, 0), T = Math.max(r[1], cl ? cl[1] : 0, 0), R = Math.min(r[2], cl ? cl[2] : bw, bw), B = Math.min(r[3], cl ? cl[3] : bh, bh);
   if (R <= L || B <= T) return;
-  if (cv.__main) { drawCount++; N.clearRect(L, T, R - L, B - T); }
+  if (cv.__main) nClear(L, T, R - L, B - T);
   else { cv.__ver++; for (var yy = T; yy < B; yy++) { var i = (yy * bw + L) * 4; for (var xx = L; xx < R; xx++, i += 4) { cv.__buf[i] = cv.__buf[i + 1] = cv.__buf[i + 2] = cv.__buf[i + 3] = 0; } } }
 };
 
@@ -1356,7 +1372,7 @@ g.__boot = function () {
   g.__fire('DOMContentLoaded', { type: 'DOMContentLoaded' });
   g.__fire('load', { type: 'load' });
 };
-g.__frame = function (t, mask) {
+function frameInner(t, mask) {
   now = t;
   var mr = mainCanvas ? menuRoot() : null, gameOn = !!(byId.game && byId.game.__hidden === false);
   var diff = mask ^ prev;
@@ -1390,5 +1406,11 @@ g.__frame = function (t, mask) {
     else if (mr && uiDirty) { drawMenu(mr); uiDirty = false; }
   } else if (mr && uiDirty) { drawMenu(mr); uiDirty = false; }
   else if (!mr && uiDirty) { uiDirty = false; }
+}
+g.__frame = function (t, mask) {
+  cur = [];
+  try { frameInner(t, mask); }
+  catch (e) { g.console.log('ERR frame: ' + (e && e.stack || e)); }
+  if (cur.length) last = cur; else if (last) replay(last);
 };
 })(globalThis);
