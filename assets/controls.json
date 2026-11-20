@@ -1,0 +1,19 @@
+{
+ "map": {
+  "up": "ArrowUp",
+  "down": "ArrowDown",
+  "left": "ArrowLeft",
+  "right": "ArrowRight",
+  "start": "Enter",
+  "select": "Escape",
+  "cross": "z",
+  "circle": "x",
+  "square": "c",
+  "triangle": "v",
+  "l1": "a",
+  "r1": "s",
+  "l2": "q",
+  "r2": "w"
+ },
+ "detected": []
+}
