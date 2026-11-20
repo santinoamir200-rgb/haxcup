@@ -1,7 +1,8 @@
-/* Runtime html2ps3: QuickJS + SDL2 + libio (pad). Parte 1: Canvas 2D basico. */
+/* Runtime html2ps3: QuickJS + SDL2 + libio (pad). v3: log a USRDIR/log.txt, pantalla de carga, menos memoria al cargar. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
 #include <sysutil/sysutil.h>
@@ -20,6 +21,18 @@ static SDL_Renderer *R;
 static SDL_Texture *TX[4096];
 static int NT = 0;
 static int running = 1;
+static FILE *logf_ = NULL;
+
+/* imprime en consola y en USRDIR/log.txt (se reescribe en cada arranque); fflush siempre
+   para que, si la consola se cuelga, el log tenga hasta el ultimo paso */
+static void lg(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    printf("%s\n", buf); fflush(stdout);
+    if (logf_) { fprintf(logf_, "%s\n", buf); fflush(logf_); }
+}
 
 static double D(JSContext *c, JSValueConst v) { double d = 0; JS_ToFloat64(c, &d, v); return d; }
 
@@ -35,16 +48,17 @@ static unsigned char *slurp(const char *rel, size_t *len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    unsigned char *b = malloc(n > 0 ? n : 1);
+    unsigned char *b = malloc(n > 0 ? (size_t)n + 1 : 1);
     if (!b) { fclose(f); return NULL; }
     *len = fread(b, 1, n, f);
+    b[*len] = 0;
     fclose(f);
     return b;
 }
 
 static JSValue n_log(JSContext *c, JSValueConst t, int argc, JSValueConst *argv) {
     const char *s = JS_ToCString(c, argv[0]);
-    if (s) { printf("[js] %s\n", s); fflush(stdout); JS_FreeCString(c, s); }
+    if (s) { lg("[js] %s", s); JS_FreeCString(c, s); }
     return JS_UNDEFINED;
 }
 
@@ -175,39 +189,71 @@ static int pad_mask(void) {
 static void dump_exc(JSContext *c) {
     JSValue ex = JS_GetException(c);
     const char *s = JS_ToCString(c, ex);
-    printf("[js] EXCEPCION: %s\n", s ? s : "?");
+    lg("[js] EXCEPCION: %s", s ? s : "?");
     if (s) JS_FreeCString(c, s);
     JSValue st = JS_GetPropertyStr(c, ex, "stack");
     if (!JS_IsUndefined(st)) {
         const char *ss = JS_ToCString(c, st);
-        if (ss) { printf("%s\n", ss); JS_FreeCString(c, ss); }
+        if (ss) { lg("%s", ss); JS_FreeCString(c, ss); }
     }
     JS_FreeValue(c, st); JS_FreeValue(c, ex);
-    fflush(stdout);
+}
+
+/* pantalla de carga: se presenta dos veces porque SDL usa doble buffer.
+   Mientras se parsea game.js (3,4 MB) la consola no puede dibujar, asi que se ve esto */
+static void splash(int pct) {
+    int i;
+    if (!R) return;
+    for (i = 0; i < 2; i++) {
+        SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(R, 10, 25, 21, 255);
+        SDL_RenderClear(R);
+        SDL_SetRenderDrawColor(R, 0, 179, 107, 255);
+        SDL_Rect top = { 0, 0, 1280, 8 };
+        SDL_RenderFillRect(R, &top);
+        SDL_SetRenderDrawColor(R, 34, 46, 42, 255);
+        SDL_Rect bar = { 340, 340, 600, 24 };
+        SDL_RenderFillRect(R, &bar);
+        SDL_SetRenderDrawColor(R, 0, 179, 107, 255);
+        SDL_Rect fill = { 344, 344, (592 * pct) / 100, 16 };
+        SDL_RenderFillRect(R, &fill);
+        SDL_RenderPresent(R);
+    }
+    sysUtilCheckCallback();
 }
 
 static int run_file(JSContext *c, const char *rel) {
-    size_t n = 0; unsigned char *b = slurp(rel, &n);
-    if (!b) { printf("[js] no encuentro %s\n", rel); return -1; }
-    char *src = malloc(n + 1); memcpy(src, b, n); src[n] = 0; free(b);
-    JSValue v = JS_Eval(c, src, n, rel, JS_EVAL_TYPE_GLOBAL);
+    size_t n = 0; unsigned char *src = slurp(rel, &n);
+    if (!src) { lg("[js] no encuentro %s", rel); return -1; }
+    lg("[js] cargando %s (%lu bytes)", rel, (unsigned long)n);
+    JSValue v = JS_Eval(c, (const char *)src, n, rel, JS_EVAL_TYPE_GLOBAL);
     free(src);
     int bad = JS_IsException(v);
     if (bad) dump_exc(c);
     JS_FreeValue(c, v);
+    lg("[js] %s listo (%s)", rel, bad ? "CON ERROR" : "ok");
     return bad ? -1 : 0;
 }
 
 #define REG(name, fn, nargs) JS_SetPropertyStr(ctx, nat, name, JS_NewCFunction(ctx, fn, name, nargs))
 
 int main(void) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0) return 1;
+    char lp[512];
+    if (fullpath("log.txt", lp, sizeof lp)) logf_ = fopen(lp, "w");
+    lg("[boot] HaxCup runtime v3");
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0) { lg("[boot] SDL_Init fallo"); return 1; }
+    lg("[boot] SDL_Init ok");
     IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG);
     W = SDL_CreateWindow("game", 0, 0, 1280, 720, 0);
+    if (!W) lg("[boot] SDL_CreateWindow fallo");
     R = SDL_CreateRenderer(W, -1, SDL_RENDERER_PRESENTVSYNC);
+    if (!R) { lg("[boot] renderer con vsync fallo, pruebo sin flags"); R = SDL_CreateRenderer(W, -1, 0); }
+    if (!R) { lg("[boot] no hay renderer, salgo"); return 1; }
     SDL_RenderSetLogicalSize(R, 1280, 720);
     sysUtilRegisterCallback(0, sysutil_cb, NULL);
     ioPadInit(7);
+    lg("[boot] video y pad ok");
+    splash(10);
 
     JSRuntime *rt = JS_NewRuntime();
     JSContext *ctx = JS_NewContext(rt);
@@ -219,26 +265,51 @@ int main(void) {
     REG("clearRect", n_clearRect, 4); REG("loadImage", n_loadImage, 1);
     REG("drawImage", n_drawImage, 10);
     JS_SetPropertyStr(ctx, global, "__native", nat);
+    lg("[boot] quickjs ok");
+    splash(25);
 
-    if (run_file(ctx, "shim.js") == 0) {
+    int shim_ok = (run_file(ctx, "shim.js") == 0);
+    splash(40);
+    if (shim_ok) {
+        splash(50);   /* lo ultimo que se ve mientras se parsea game.js: puede tardar varios segundos */
         run_file(ctx, "game.js");
+        splash(90);
         JSValue boot = JS_GetPropertyStr(ctx, global, "__boot");
+        lg("[boot] llamando __boot");
         JSValue r = JS_Call(ctx, boot, JS_UNDEFINED, 0, NULL);
         if (JS_IsException(r)) dump_exc(ctx);
         JS_FreeValue(ctx, r); JS_FreeValue(ctx, boot);
+        { JSContext *c1; while (JS_ExecutePendingJob(rt, &c1) > 0) {} }
+        lg("[boot] __boot listo");
     }
     JSValue frame = JS_GetPropertyStr(ctx, global, "__frame");
+    int have_frame = JS_IsFunction(ctx, frame);
+    if (!have_frame) lg("[boot] no hay __frame: el shim no cargo bien (mira el error de arriba)");
+    lg("[boot] entrando al bucle");
+    unsigned long nf = 0, acc = 0;
     while (running) {
         sysUtilCheckCallback();
-        JSValue args[2] = { JS_NewFloat64(ctx, (double)SDL_GetTicks()), JS_NewInt32(ctx, pad_mask()) };
-        JSValue r = JS_Call(ctx, frame, JS_UNDEFINED, 2, args);
-        if (JS_IsException(r)) dump_exc(ctx);
-        JS_FreeValue(ctx, r);
-        JSContext *c1;
-        while (JS_ExecutePendingJob(rt, &c1) > 0) {}
+        if (have_frame) {
+            Uint32 t0 = SDL_GetTicks();
+            JSValue args[2] = { JS_NewFloat64(ctx, (double)t0), JS_NewInt32(ctx, pad_mask()) };
+            JSValue r = JS_Call(ctx, frame, JS_UNDEFINED, 2, args);
+            if (JS_IsException(r)) dump_exc(ctx);
+            JS_FreeValue(ctx, r);
+            JSContext *c1;
+            int guard = 0;
+            while (JS_ExecutePendingJob(rt, &c1) > 0 && ++guard < 10000) {}
+            acc += SDL_GetTicks() - t0;
+            nf++;
+            if (nf <= 3 || nf % 300 == 0) { lg("[frame] #%lu, %lu ms de JS promedio", nf, acc / nf); }
+        } else {
+            SDL_SetRenderDrawColor(R, 120, 20, 20, 255);
+            SDL_RenderClear(R);
+        }
         SDL_RenderPresent(R);
         SDL_Delay(1);
     }
+    lg("[boot] saliendo");
+    if (logf_) fclose(logf_);
     JS_FreeValue(ctx, frame); JS_FreeValue(ctx, global);
     SDL_Quit();
     return 0;
